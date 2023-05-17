@@ -9,7 +9,10 @@
 #include <ctype.h>
 #include <stdint.h>
 
-static const orxSTRING orxFASTCALL soloscuro_gff_locate(const orxSTRING _zStorage, const orxSTRING _zName, orxBOOL _bRequireExistence);
+#include "soloscuro.h"
+#include "soloscuro/font.h"
+
+static const orxSTRING orxFASTCALL soloscuro_gff_locate(const orxSTRING group, const orxSTRING storage, const orxSTRING name, orxBOOL required);
 static orxS64 orxFASTCALL          soloscuro_gff_gettime(const orxSTRING _zLocation);
 static orxHANDLE orxFASTCALL       soloscuro_gff_open(const orxSTRING _zLocation, orxBOOL _bEraseMode);
 static void orxFASTCALL            soloscuro_gff_close(orxHANDLE _hResource);
@@ -30,6 +33,8 @@ typedef struct gff_entry_params_s {
     uint32_t res_id;
     uint32_t frame;
     gff_palette_t *pal;
+    // For fonts
+    uint32_t fg_color, bg_color;
 } gff_entry_params_t;
 
 // Represents the gff data in memory.
@@ -73,10 +78,14 @@ unsigned char bmp_header[] = {// All values are little-endian
     0x00, 0x00, 0x00, 0x00, // Unknown
 };
 
-extern int soloscuro_register_gff_type() {
+extern gff_manager_t* soloscuro_get_gff_manager() {
+    return gff_manager;
+}
+
+extern int soloscuro_register_gff_type(soloscuro_state_t *state) {
     int status = EXIT_FAILURE;
     if (gff_manager == NULL) {
-        gff_manager = gff_manager_create();
+        state->man = gff_manager = gff_manager_create();
         gff_manager_load_ds1(gff_manager, "ds1/");
     }
 
@@ -118,7 +127,7 @@ static int is_gff_name(const orxSTRING name) {
 static int get_next_token(const char *ptr, char *buf) {
     int32_t pos = 0;
 
-    while (*ptr != ':' && *ptr != '\0') {
+    while (*ptr != '/' && *ptr != '.' && *ptr != '\0') {
         buf[pos++] = tolower(*ptr);
         ptr++;
     }
@@ -205,6 +214,36 @@ static int set_file_from_string(gff_entry_params_t *params, const char *str) {
     return EXIT_FAILURE;
 }
 
+static int load_font(gff_entry_params_t *params, gff_entry_data_t **font) {
+    uint8_t  *data;
+    int32_t   w, h;
+    uint32_t *bmp_ptr = (uint32_t*)(bmp_header + 2);
+    uint32_t  len;
+
+    //soloscuro_font_load(soloscuro_get_gff_manager(), &data, &w, &h, params->fg_color, params->bg_color);
+    gff_manager_font_load(soloscuro_get_gff_manager(), &data, &w, &h, params->fg_color, params->bg_color);
+    len = sizeof(bmp_header) + 4 * w * h; // size
+    bmp_ptr[0] = len; // size
+    bmp_ptr[4] = w;
+    bmp_ptr[5] = h;
+    *font = (gff_entry_data_t*)calloc(1, sizeof(gff_entry_data_t) + len);
+
+    memcpy((*font)->data, bmp_header, sizeof(bmp_header));
+    memcpy((*font)->data + sizeof(bmp_header), data, len - sizeof(bmp_header));
+    (*font)->size = len; // size
+
+    /*
+    FILE *file = fopen("font.bmp", "wb+");
+    fwrite((*font)->data, len, 1, file);
+    fclose(file);
+    */
+
+    free(data);
+
+    return EXIT_SUCCESS;
+}
+
+
 static int set_entry_type_from_string(gff_entry_params_t *params, const char *str) {
     if (!strncmp("icon", str, 4)) {
         params->type = GFF_ICON;
@@ -228,6 +267,11 @@ static int set_entry_type_from_string(gff_entry_params_t *params, const char *st
 
     if (!strncmp("wall", str, 4)) {
         params->type = GFF_WALL;
+        goto success;
+    }
+
+    if (!strncmp("font", str, 4)) {
+        params->type = GFF_FONT;
         goto success;
     }
     
@@ -288,11 +332,6 @@ static int grab_params(const orxSTRING name, gff_entry_params_t *params) {
     }
 
     pos += get_next_token(ptr + pos, buf);
-    if (set_entry_type_from_string(params, buf)) {
-        goto entry_type_error;
-    }
-
-    pos += get_next_token(ptr + pos, buf);
     params->res_id = strtol(buf, &end_ptr, 10);
     if (buf[0] == '\0' || *end_ptr != '\0') {
         goto res_id_error;
@@ -300,17 +339,30 @@ static int grab_params(const orxSTRING name, gff_entry_params_t *params) {
 
     pos += get_next_token(ptr + pos, buf);
     params->frame = strtol(buf, &end_ptr, 10);
+    params->fg_color = strtol(buf, &end_ptr, 16);
     if (buf[0] == '\0' || *end_ptr != '\0') {
         goto frame_error;
     }
 
     pos += get_next_token(ptr + pos, buf);
-    if (set_palette_from_string(params, buf)) {
-        goto palette_error;
+    //if (params->type == GFF_FONT) {
+        params->bg_color = strtol(buf, &end_ptr, 16);
+        //if (buf[0] == '\0' || *end_ptr != '\0') {
+            //goto bg_error;
+        //}
+    set_palette_from_string(params, buf);
+    //} else if (set_palette_from_string(params, buf)) {
+        //goto palette_error;
+    //}
+
+    pos += get_next_token(ptr + pos, buf);
+    if (set_entry_type_from_string(params, buf)) {
+        goto entry_type_error;
     }
 
     return EXIT_SUCCESS;
 
+bg_error:
 palette_error:
 frame_error:
 res_id_error:
@@ -335,11 +387,16 @@ static int open_gff_graphic(gff_entry_params_t *params, gff_entry_data_t **data)
     gff_chunk_header_t chunk;
     char               type[5];
 
+    if (params->type == GFF_FONT) {
+        return load_font(params, data);
+    }
+
     if (params->type != GFF_BMP && params->type != GFF_ICON && params->type != GFF_PORT
             && params->type != GFF_TILE && params->type != GFF_WALL) {
         goto not_a_graphic_entry;
     }
 
+    //printf("frame: %d, res_id = %d\n", params->frame, params->res_id);
     gff_frame_info(params->f, params->type, params->res_id, params->frame, &info);
     //printf("%d x %d\n", info.w, info.h);
 
@@ -361,13 +418,14 @@ static int open_gff_graphic(gff_entry_params_t *params, gff_entry_data_t **data)
     cimg->data_len = chunk.length;
     cimg->frame_num = *(uint16_t*)(cimg->data + 4);
 
-    //printf("%s:%s:%d: has %d frames\n", "resource", type, params->res_id, cimg->frame_num);
+    //printf("%s:%s:%d: has %d frames, length = %d, loading frame: %d\n", "resource", type, params->res_id, cimg->frame_num, cimg->data_len, params->frame);
 
-    udata = (uint32_t*)gff_get_frame_rgba_palette_img(cimg, 0, params->pal);
+    udata = (uint32_t*)gff_get_frame_rgba_palette_img(cimg, params->frame, params->pal);
+    //printf("return\n");
     if (!udata) {
         goto rgba_error;
     }
-    bmp_ptr[0] = sizeof(bmp_header) + 32 * info.w * info.h; // size
+    bmp_ptr[0] = sizeof(bmp_header) + 4 * info.w * info.h; // size
     bmp_ptr[4] = info.w;
     bmp_ptr[5] = info.h;
     img = malloc(sizeof(gff_entry_data_t) + bmp_ptr[0]);
@@ -375,8 +433,9 @@ static int open_gff_graphic(gff_entry_params_t *params, gff_entry_data_t **data)
         goto img_mem_error;
     }
     memset(img, 0x0, sizeof(gff_entry_data_t));
-    img->size = sizeof(bmp_header) + 32 * info.w * info.h; // size
+    img->size = sizeof(bmp_header) + 4 * info.w * info.h; // size
     memcpy(img->data, bmp_header, sizeof(bmp_header));
+    //printf("udata = %p, copying: %d, size = %d\n", udata, img->size - sizeof(bmp_header), img->size);
     memcpy(img->data + sizeof(bmp_header), udata, img->size - sizeof(bmp_header));
 
     free(udata);
@@ -407,9 +466,11 @@ out:
     return status;
 }
 
-static const orxSTRING orxFASTCALL soloscuro_gff_locate(const orxSTRING storage, const orxSTRING name, orxBOOL required) {
+//static const orxSTRING orxFASTCALL soloscuro_gff_locate(const orxSTRING storage, const orxSTRING name, orxBOOL required) {
+static const orxSTRING orxFASTCALL soloscuro_gff_locate(const orxSTRING group, const orxSTRING storage, const orxSTRING name, orxBOOL required) {
     gff_entry_params_t params;
 
+    //printf("looking @ '%s':'%s':'%s'\n", group, storage, name);
     if (grab_params(name, &params) == EXIT_FAILURE) {
         goto not_a_gff_entry;
     }
@@ -418,7 +479,6 @@ static const orxSTRING orxFASTCALL soloscuro_gff_locate(const orxSTRING storage,
         goto entry_dne;
     }
 
-    //printf("storage: %s, name: %s, exists!\n", storage, name);
     return name;
 
 entry_dne:
@@ -451,19 +511,16 @@ not_a_gff_entry:
 }
 
 static void orxFASTCALL soloscuro_gff_close(orxHANDLE entry) {
-    //printf("close\n");
     free(entry);
     entry = NULL;
 }
 
 static orxS64 orxFASTCALL soloscuro_gff_getsize(orxHANDLE res) {
     gff_entry_data_t *data = (gff_entry_data_t*) res;
-    //printf("size: %d\n", img->size);
     return data->size;
 }
 
 static orxS64 orxFASTCALL soloscuro_gff_seek(orxHANDLE res, orxS64 offset, orxSEEK_OFFSET_WHENCE whence) {
-    //printf("seek: offset: %d, whence: %d\n", offset, whence);
     gff_entry_data_t *data = (gff_entry_data_t*) res;
 
     switch (whence) {
@@ -501,7 +558,6 @@ static orxS64 orxFASTCALL soloscuro_gff_read(orxHANDLE res, orxS64 len, void *bu
     if (amt < 0) { amt = 0; }
 
     //printf("read: len = %d, data_pos = %d, amt = %d\n", len, data_pos, amt);
-
     memcpy(buf, data->data + data->pos, amt);
 
     data->pos += amt;
