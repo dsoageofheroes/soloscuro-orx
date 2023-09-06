@@ -1,3 +1,8 @@
+# THIS PROJECT HAS MOVED
+
+Due to github's security policy the new website:
+https://bitbucket.org/PauloftheWest/soloscuro/
+
 # soloscuro
 
 A Dark Sun Engine
